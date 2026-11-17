@@ -1932,7 +1932,7 @@ fn webcrypto_aes_kw(key: &[u8], data: &[u8], wrapping: bool) -> Option<Vec<u8>> 
         }
     }
 
-    if data.len() % 8 != 0 || data.len() < if wrapping { 16 } else { 24 } {
+    if !data.len().is_multiple_of(8) || data.len() < if wrapping { 16 } else { 24 } {
         return None;
     }
     match key.len() {
@@ -1940,59 +1940,6 @@ fn webcrypto_aes_kw(key: &[u8], data: &[u8], wrapping: bool) -> Option<Vec<u8>> 
         24 => run(aes::Aes192::new_from_slice(key).ok()?, data, wrapping),
         32 => run(aes::Aes256::new_from_slice(key).ok()?, data, wrapping),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod aes_kw_tests {
-    use super::webcrypto_aes_kw;
-
-    fn hex(value: &str) -> Vec<u8> {
-        value
-            .as_bytes()
-            .chunks_exact(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn rfc3394_vectors_and_integrity() {
-        let data = hex("00112233445566778899AABBCCDDEEFF");
-        for (size, expected) in [
-            (16, "1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5"),
-            (24, "96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D"),
-            (32, "64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7"),
-        ] {
-            let key: Vec<u8> = (0..size).collect();
-            let expected = hex(expected);
-            assert_eq!(webcrypto_aes_kw(&key, &data, true), Some(expected.clone()));
-            assert_eq!(webcrypto_aes_kw(&key, &expected, false), Some(data.clone()));
-            for index in 0..expected.len() {
-                let mut modified = expected.clone();
-                modified[index] ^= 1;
-                assert!(webcrypto_aes_kw(&key, &modified, false).is_none());
-            }
-            assert!(webcrypto_aes_kw(&vec![0xff; size.into()], &expected, false).is_none());
-        }
-        let key: Vec<u8> = (0..32).collect();
-        let data = hex("00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F");
-        let wrapped =
-            hex("28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21");
-        assert_eq!(webcrypto_aes_kw(&key, &data, true), Some(wrapped.clone()));
-        assert_eq!(webcrypto_aes_kw(&key, &wrapped, false), Some(data));
-    }
-
-    #[test]
-    fn rejects_invalid_key_and_data_lengths() {
-        for size in [0, 8, 15, 17, 23, 25, 31, 33] {
-            assert!(webcrypto_aes_kw(&vec![0; size], &[0; 16], true).is_none());
-        }
-        for size in [0, 8, 15, 17, 23] {
-            assert!(webcrypto_aes_kw(&[0; 16], &vec![0; size], true).is_none());
-        }
-        for size in [0, 8, 16, 23, 25] {
-            assert!(webcrypto_aes_kw(&[0; 16], &vec![0; size], false).is_none());
-        }
     }
 }
 
@@ -2136,4 +2083,59 @@ pub(super) fn op_webcrypto_aes_decrypt(
     rv: v8::ReturnValue<v8::Value>,
 ) {
     op_webcrypto_aes(scope, args, rv, false);
+}
+
+#[cfg(test)]
+mod aes_kw_tests {
+    use super::webcrypto_aes_kw;
+
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn rfc3394_vectors_and_integrity() {
+        let data = hex("00112233445566778899AABBCCDDEEFF");
+        for (size, expected) in [
+            (16, "1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5"),
+            (24, "96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D"),
+            (32, "64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7"),
+        ] {
+            let key: Vec<u8> = (0..size).collect();
+            let expected = hex(expected);
+            assert_eq!(webcrypto_aes_kw(&key, &data, true), Some(expected.clone()));
+            assert_eq!(webcrypto_aes_kw(&key, &expected, false), Some(data.clone()));
+            for index in 0..expected.len() {
+                let mut modified = expected.clone();
+                modified[index] ^= 1;
+                assert!(webcrypto_aes_kw(&key, &modified, false).is_none());
+            }
+            assert!(webcrypto_aes_kw(&vec![0xff; size.into()], &expected, false).is_none());
+        }
+        let key: Vec<u8> = (0..32).collect();
+        let data = hex("00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F");
+        let wrapped =
+            hex("28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21");
+        assert_eq!(webcrypto_aes_kw(&key, &data, true), Some(wrapped.clone()));
+        assert_eq!(webcrypto_aes_kw(&key, &wrapped, false), Some(data));
+    }
+
+    #[test]
+    fn rejects_invalid_key_and_data_lengths() {
+        for size in [0, 8, 15, 17, 23, 25, 31, 33] {
+            assert!(webcrypto_aes_kw(&vec![0; size], &[0; 16], true).is_none());
+        }
+        for size in [0, 8, 15, 17, 23] {
+            assert!(webcrypto_aes_kw(&[0; 16], &vec![0; size], true).is_none());
+        }
+        for size in [0, 8, 16, 23, 25] {
+            assert!(webcrypto_aes_kw(&[0; 16], &vec![0; size], false).is_none());
+        }
+    }
 }
