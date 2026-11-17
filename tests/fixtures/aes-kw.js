@@ -92,6 +92,45 @@ export default {
       const unwrapOnly = await subtle.importKey("raw", raw, "AES-KW", false, ["unwrapKey"]);
       await rejects(() => subtle.wrapKey("raw", key, unwrapOnly, "AES-KW"), "InvalidAccessError");
       await rejects(() => subtle.wrapKey("raw", key, key, "AES-KW"), "InvalidAccessError");
+      const pair = await subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, [
+        "sign",
+        "verify",
+      ]);
+      const jwk = await subtle.exportKey("jwk", pair.publicKey);
+      const jsonLength = new TextEncoder().encode(JSON.stringify(jwk)).byteLength;
+      assert(jsonLength % 8 !== 0, "JWK fixture must require padding");
+      const wrapping = await subtle.importKey("raw", raw, "AES-KW", false, [
+        "wrapKey",
+        "unwrapKey",
+      ]);
+      const wrappedJwk = await subtle.wrapKey("jwk", pair.publicKey, wrapping, "AES-KW");
+      assert(
+        wrappedJwk.byteLength === Math.ceil(jsonLength / 8) * 8 + 8,
+        "JWK padding length mismatch",
+      );
+      const publicKey = await subtle.unwrapKey(
+        "jwk",
+        wrappedJwk,
+        wrapping,
+        "AES-KW",
+        { name: "ECDSA", namedCurve: "P-256" },
+        true,
+        ["verify"],
+      );
+      const unwrappedJwk = await subtle.exportKey("jwk", publicKey);
+      for (const field of ["kty", "crv", "x", "y"]) {
+        assert(unwrappedJwk[field] === jwk[field], `JWK ${field} changed`);
+      }
+      const message = new TextEncoder().encode("Wrapped JWK round trip");
+      const signature = await subtle.sign(
+        { name: "ECDSA", hash: "SHA-256" },
+        pair.privateKey,
+        message,
+      );
+      assert(
+        await subtle.verify({ name: "ECDSA", hash: "SHA-256" }, publicKey, signature, message),
+        "Unwrapped JWK cannot verify",
+      );
       return Response.json({ ok: true });
     } catch (error) {
       return new Response(error.stack ?? String(error), { status: 500 });

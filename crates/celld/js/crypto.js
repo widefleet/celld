@@ -717,10 +717,20 @@
     // as its JSON bytes.
     async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
       const exported = await this.exportKey(format, key);
-      const raw = format === "jwk"
+      let raw = format === "jwk"
         ? new TextEncoder().encode(JSON.stringify(exported))
         : exported;
-      if (_algorithmName(wrapAlgorithm) === "AES-KW") return _kw(wrappingKey, raw, true);
+      if (_algorithmName(wrapAlgorithm) === "AES-KW") {
+        // JWK permits trailing JSON whitespace. Use spaces to satisfy
+        // RFC 3394's 8-byte alignment without changing the exported key.
+        if (format === "jwk" && raw.byteLength % 8 !== 0) {
+          const padded = new Uint8Array(Math.ceil(raw.byteLength / 8) * 8);
+          padded.set(raw);
+          padded.fill(0x20, raw.byteLength);
+          raw = padded;
+        }
+        return _kw(wrappingKey, raw, true);
+      }
       return this.encrypt(wrapAlgorithm, wrappingKey, raw);
     }
 

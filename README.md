@@ -69,24 +69,47 @@ lists each gap in the services above.
 
 ## Install
 
-The installer downloads the `celld` binary (provenance is verifiable with
-`gh attestation verify`):
+Download this fork from [widefleet/celld releases](https://github.com/widefleet/celld/releases).
+The upstream installer at `celld.dev/install.sh` installs upstream celld,
+which does not include this fork's AES-KW addition.
+
+For Linux x86-64, install the pinned fork binary and verify its checksum:
 
 ```sh
-curl -fsSL https://celld.dev/install.sh | sh
+(
+  set -eu
+  celld_version=0.6.3-widefleet.1
+  celld_target=x86_64-unknown-linux-gnu
+  celld_download=$(mktemp -d)
+  trap 'rm -rf "$celld_download"' EXIT
+  cd "$celld_download"
+  for asset in "celld-$celld_target.gz" "celld-$celld_target.sha256" LICENSE NOTICE; do
+    curl --fail --location --proto '=https' \
+      "https://github.com/widefleet/celld/releases/download/v$celld_version/$asset" \
+      --output "$asset"
+  done
+  gzip -dc "celld-$celld_target.gz" > celld
+  shasum -a 256 --check "celld-$celld_target.sha256"
+  mkdir -p "$HOME/.local/bin" "$HOME/.local/share/celld"
+  install -m 755 celld "$HOME/.local/bin/celld"
+  install -m 644 LICENSE NOTICE "$HOME/.local/share/celld/"
+)
+"$HOME/.local/bin/celld" --version
 ```
 
-Put `~/.local/bin` on your `PATH` if the installer asks you to.
+For Linux ARM64, use `aarch64-unknown-linux-gnu`; for macOS ARM64, use
+`aarch64-apple-darwin`. Put `~/.local/bin` on your `PATH`.
+Build provenance for a downloaded `.gz` asset can also be verified with
+`gh attestation verify ASSET --repo widefleet/celld`.
 
 Worker projects deployed with `celld deploy` need
 [esbuild](https://esbuild.github.io) on `PATH`; asset-only projects do not.
 
-The installer keeps each release under `~/.local/lib/celld/releases` and points
-one symlink at the current one. To remove celld, delete the symlink and the
-releases:
+To remove this installation:
 
 ```sh
-rm `which celld` && rm -rf ~/.local/lib/celld
+rm "$HOME/.local/bin/celld"
+rm "$HOME/.local/share/celld/LICENSE" "$HOME/.local/share/celld/NOTICE"
 ```
 
 ## Container
@@ -95,7 +118,7 @@ The release image contains the `celld` binary and is published for Linux
 x86-64 and ARM64:
 
 ```sh
-docker run --rm ghcr.io/denoland/celld --version
+docker run --rm ghcr.io/widefleet/celld:0.6.3-widefleet.1 --version
 ```
 
 Persist the runtime's local state and pass the standard AWS credential
@@ -109,7 +132,7 @@ docker run --rm --network host \
   -e AWS_SESSION_TOKEN \
   -e CELLD_WATCH=/var/lib/celld/state \
   -v celld-state:/var/lib/celld \
-  ghcr.io/denoland/celld \
+  ghcr.io/widefleet/celld:0.6.3-widefleet.1 \
   --bucket s3://my-cells-bucket \
   --endpoint https://ACCOUNT.r2.cloudflarestorage.com \
   --region auto \
