@@ -18,7 +18,7 @@
     "SHA-1", "SHA-256", "SHA-384", "SHA-512", "MD5",
   ]);
   const _SECRET_KEY_ALGS = new Set(
-    ["HMAC", "AES-GCM", "AES-CBC", "AES-CTR"],
+    ["HMAC", "AES-GCM", "AES-CBC", "AES-CTR", "AES-KW"],
   );
   // Cloudflare accepts its own pre-standard curve spellings beside the
   // standard ones.
@@ -90,6 +90,24 @@
 
   function _operationError(message) {
     return new DOMException(message, "OperationError");
+  }
+
+  function _kwUsages(usages) {
+    if (!usages.length || Array.from(usages).some(usage => usage !== "wrapKey" && usage !== "unwrapKey")) {
+      throw new DOMException("AES-KW keys may only wrap or unwrap keys", "SyntaxError");
+    }
+  }
+
+  function _kw(key, data, wrapping) {
+    if (!(key instanceof CryptoKey) || key.algorithm.name !== "AES-KW" ||
+        !key.usages.includes(wrapping ? "wrapKey" : "unwrapKey")) {
+      throw new DOMException("Key cannot perform this AES-KW operation", "InvalidAccessError");
+    }
+    const run = wrapping ? _aesEncrypt : _aesDecrypt;
+    const result = run("AES-KW", key.__celldMaterial.bytes, new Uint8Array(),
+      _toBuf(data), new Uint8Array(), 0);
+    if (!result) throw _operationError("AES-KW operation failed");
+    return result.buffer.slice(result.byteOffset, result.byteOffset + result.byteLength);
   }
 
   function _rsaOaepLabel(algorithm) {
@@ -242,6 +260,12 @@
       }
       if (format === "raw" && _SECRET_KEY_ALGS.has(name)) {
         const raw = _toBuf(keyData).slice();
+        if (name === "AES-KW") {
+          _kwUsages(usages);
+          if (![16, 24, 32].includes(raw.byteLength)) {
+            throw new DOMException("AES-KW requires a 128-, 192- or 256-bit key", "DataError");
+          }
+        }
         const normalized = name === "HMAC"
           ? { name, hash: { name: _hashName(algorithm?.hash) }, length: raw.byteLength * 8 }
           : { name, length: raw.byteLength * 8 };
@@ -487,9 +511,12 @@
             { bytes: raw },
           );
         }
-        byteLength = Number(algorithm?.length || 256) / 8;
-        if (byteLength !== 16 && byteLength !== 32) {
-          throw new DOMException("AES-GCM length must be 128 or 256", "OperationError");
+        byteLength = Number(name === "AES-KW" ? algorithm?.length : (algorithm?.length || 256)) / 8;
+        if (name === "AES-KW") _kwUsages(usages);
+        if (byteLength !== 16 && byteLength !== 32 && !(name === "AES-KW" && byteLength === 24)) {
+          throw new DOMException(name === "AES-KW"
+            ? "AES-KW length must be 128, 192 or 256"
+            : "AES-GCM length must be 128 or 256", "OperationError");
         }
         const raw = new Uint8Array(byteLength);
         crypto.getRandomValues(raw);
@@ -685,14 +712,25 @@
       throw _notSupported("unsupported encrypt algorithm: " + name);
     }
 
-    // wrapKey and unwrapKey compose the primitives exactly the way the
-    // spec defines them: export + encrypt, and decrypt + import. A
-    // jwk-format key crosses as its JSON bytes.
+    // AES-KW is a wrapping-only operation. Other algorithms compose
+    // export + encrypt, and decrypt + import. A jwk-format key crosses
+    // as its JSON bytes.
     async wrapKey(format, key, wrappingKey, wrapAlgorithm) {
       const exported = await this.exportKey(format, key);
-      const raw = format === "jwk"
+      let raw = format === "jwk"
         ? new TextEncoder().encode(JSON.stringify(exported))
         : exported;
+      if (_algorithmName(wrapAlgorithm) === "AES-KW") {
+        // JWK permits trailing JSON whitespace. Use spaces to satisfy
+        // RFC 3394's 8-byte alignment without changing the exported key.
+        if (format === "jwk" && raw.byteLength % 8 !== 0) {
+          const padded = new Uint8Array(Math.ceil(raw.byteLength / 8) * 8);
+          padded.set(raw);
+          padded.fill(0x20, raw.byteLength);
+          raw = padded;
+        }
+        return _kw(wrappingKey, raw, true);
+      }
       return this.encrypt(wrapAlgorithm, wrappingKey, raw);
     }
 
@@ -700,7 +738,9 @@
       format, wrapped, unwrappingKey, unwrapAlgorithm,
       algorithm, extractable, usages,
     ) {
-      const raw = await this.decrypt(unwrapAlgorithm, unwrappingKey, wrapped);
+      const raw = _algorithmName(unwrapAlgorithm) === "AES-KW"
+        ? _kw(unwrappingKey, wrapped, false)
+        : await this.decrypt(unwrapAlgorithm, unwrappingKey, wrapped);
       const keyData = format === "jwk"
         ? JSON.parse(new TextDecoder().decode(raw))
         : raw;
