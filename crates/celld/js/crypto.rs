@@ -1855,6 +1855,7 @@ fn webcrypto_aes_gcm(
 #[derive(Clone, Copy)]
 enum AesMode {
     Gcm,
+    Kw,
     /// GCM reports a failure by returning nothing and the block modes report
     /// a cause, so the two answer to different callers and cannot share one
     /// branch.
@@ -1871,10 +1872,127 @@ impl AesMode {
     fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "AES-GCM" => Self::Gcm,
+            "AES-KW" => Self::Kw,
             "AES-CBC" => Self::Block(AesBlockMode::Cbc),
             "AES-CTR" => Self::Block(AesBlockMode::Ctr),
             _ => return None,
         })
+    }
+}
+
+/// RFC 3394 key wrap, using the fixed integrity value required by Web Crypto.
+/// Authentication failures return no plaintext, like AES-GCM above.
+fn webcrypto_aes_kw(key: &[u8], data: &[u8], wrapping: bool) -> Option<Vec<u8>> {
+    use aes::cipher::{consts::U16, Block, BlockDecrypt, BlockEncrypt, BlockSizeUser, KeyInit};
+    use subtle::ConstantTimeEq;
+
+    fn run<C: BlockEncrypt + BlockDecrypt + BlockSizeUser<BlockSize = U16>>(
+        cipher: C,
+        data: &[u8],
+        wrapping: bool,
+    ) -> Option<Vec<u8>> {
+        let mut integrity = [0xa6_u8; 8];
+        let mut result = if wrapping {
+            data.to_vec()
+        } else {
+            integrity.copy_from_slice(&data[..8]);
+            data[8..].to_vec()
+        };
+        let count = result.len() / 8;
+        for step in 0..6 * count {
+            let position = if wrapping { step } else { 6 * count - step - 1 };
+            let offset = (position % count) * 8;
+            let counter = ((position + 1) as u64).to_be_bytes();
+            let mut block = Block::<C>::default();
+            block[..8].copy_from_slice(&integrity);
+            block[8..].copy_from_slice(&result[offset..offset + 8]);
+            if wrapping {
+                cipher.encrypt_block(&mut block);
+                for index in 0..8 {
+                    block[index] ^= counter[index];
+                }
+            } else {
+                for index in 0..8 {
+                    block[index] ^= counter[index];
+                }
+                cipher.decrypt_block(&mut block);
+            }
+            integrity.copy_from_slice(&block[..8]);
+            result[offset..offset + 8].copy_from_slice(&block[8..]);
+        }
+        if wrapping {
+            let mut wrapped = Vec::with_capacity(result.len() + 8);
+            wrapped.extend_from_slice(&integrity);
+            wrapped.extend_from_slice(&result);
+            Some(wrapped)
+        } else if bool::from(integrity.ct_eq(&[0xa6; 8])) {
+            Some(result)
+        } else {
+            None
+        }
+    }
+
+    if data.len() % 8 != 0 || data.len() < if wrapping { 16 } else { 24 } {
+        return None;
+    }
+    match key.len() {
+        16 => run(aes::Aes128::new_from_slice(key).ok()?, data, wrapping),
+        24 => run(aes::Aes192::new_from_slice(key).ok()?, data, wrapping),
+        32 => run(aes::Aes256::new_from_slice(key).ok()?, data, wrapping),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod aes_kw_tests {
+    use super::webcrypto_aes_kw;
+
+    fn hex(value: &str) -> Vec<u8> {
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn rfc3394_vectors_and_integrity() {
+        let data = hex("00112233445566778899AABBCCDDEEFF");
+        for (size, expected) in [
+            (16, "1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5"),
+            (24, "96778B25AE6CA435F92B5B97C050AED2468AB8A17AD84E5D"),
+            (32, "64E8C3F9CE0F5BA263E9777905818A2A93C8191E7D6E8AE7"),
+        ] {
+            let key: Vec<u8> = (0..size).collect();
+            let expected = hex(expected);
+            assert_eq!(webcrypto_aes_kw(&key, &data, true), Some(expected.clone()));
+            assert_eq!(webcrypto_aes_kw(&key, &expected, false), Some(data.clone()));
+            for index in 0..expected.len() {
+                let mut modified = expected.clone();
+                modified[index] ^= 1;
+                assert!(webcrypto_aes_kw(&key, &modified, false).is_none());
+            }
+            assert!(webcrypto_aes_kw(&vec![0xff; size.into()], &expected, false).is_none());
+        }
+        let key: Vec<u8> = (0..32).collect();
+        let data = hex("00112233445566778899AABBCCDDEEFF000102030405060708090A0B0C0D0E0F");
+        let wrapped =
+            hex("28C9F404C4B810F4CBCCB35CFB87F8263F5786E2D80ED326CBC7F0E71A99F43BFB988B9B7A02DD21");
+        assert_eq!(webcrypto_aes_kw(&key, &data, true), Some(wrapped.clone()));
+        assert_eq!(webcrypto_aes_kw(&key, &wrapped, false), Some(data));
+    }
+
+    #[test]
+    fn rejects_invalid_key_and_data_lengths() {
+        for size in [0, 8, 15, 17, 23, 25, 31, 33] {
+            assert!(webcrypto_aes_kw(&vec![0; size], &[0; 16], true).is_none());
+        }
+        for size in [0, 8, 15, 17, 23] {
+            assert!(webcrypto_aes_kw(&[0; 16], &vec![0; size], true).is_none());
+        }
+        for size in [0, 8, 16, 23, 25] {
+            assert!(webcrypto_aes_kw(&[0; 16], &vec![0; size], false).is_none());
+        }
     }
 }
 
@@ -1977,6 +2095,11 @@ fn op_webcrypto_aes(
         return;
     };
     match parsed {
+        AesMode::Kw => {
+            if let Some(out) = webcrypto_aes_kw(&key, &data, encrypting) {
+                webcrypto_return_bytes(scope, rv, &out);
+            }
+        }
         // AES-GCM keeps reporting a failure by returning nothing, because
         // `crypto.js` turns that into the `OperationError` the Web Crypto
         // specification names. A host `Error` thrown from here would replace a
