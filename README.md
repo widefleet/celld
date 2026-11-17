@@ -1,5 +1,10 @@
 # celld
 
+This is Widefleet's fork of [denoland/celld](https://github.com/denoland/celld),
+based on v0.6.3. It adds Web Crypto AES-KW support for OAuth key wrapping.
+Fork builds use the `0.6.3-widefleet.1` version and are distributed from this
+repository's releases. The upstream license and notices are preserved.
+
 Self-hosted, distributed **Durable Objects**.
 
 celld is an open-source daemon that runs a Cloudflare Workers application
